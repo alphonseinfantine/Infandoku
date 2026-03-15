@@ -1,0 +1,124 @@
+#include <iostream>
+#include <array>
+#include <vector>
+#include <algorithm>
+#include <chrono>
+#include <cstring>
+
+// ── INFANDOKU V1 : STRUCTURES DE DONNÉES ─────────────────────────────────
+
+using Board = std::array<std::array<int, 9>, 9>;
+
+struct Masks {
+    int rows[9] = {}, cols[9] = {}, blks[9] = {};
+
+    // Initialise les masques à partir d'un état de grille
+    void init(const Board& b) {
+        memset(rows, 0, sizeof(rows)); 
+        memset(cols, 0, sizeof(cols)); 
+        memset(blks, 0, sizeof(blks));
+        for (int r = 0; r < 9; r++)
+            for (int c = 0; c < 9; c++)
+                if (b[r][c]) update(r, c, b[r][c], true);
+    }
+
+    // Ajoute ou retire un chiffre des masques (bitmask 9-bit)
+    inline void update(int r, int c, int v, bool set) {
+        int bit = 1 << (v - 1);
+        if (set) {
+            rows[r] |= bit; cols[c] |= bit; blks[(r / 3) * 3 + (c / 3)] |= bit;
+        } else {
+            rows[r] &= ~bit; cols[c] &= ~bit; blks[(r / 3) * 3 + (c / 3)] &= ~bit;
+        }
+    }
+
+    // Retourne le bitmask des candidats possibles (bits à 1 = disponibles)
+    inline int get_candidates(int r, int c) const {
+        return (~(rows[r] | cols[c] | blks[(r / 3) * 3 + (c / 3)])) & 0x1FF;
+    }
+};
+
+// ── INFANDOKU V1 : MOTEUR DE GÉNÉRATION / RÉSOLUTION ─────────────────────
+
+bool solve_infandoku_v1(Board& board, Masks& m) {
+    int best_r = -1, best_c = -1, min_choices = 10, cand_mask = 0;
+
+    // ÉTAPE 1 : MRV (Minimum Remaining Values)
+    // On cherche la case avec le moins de candidats pour réduire l'arbre de recherche
+    for (int r = 0; r < 9; r++) {
+        for (int c = 0; c < 9; c++) {
+            if (board[r][c]) continue;
+            int cands = m.get_candidates(r, c);
+            int count = __builtin_popcount(cands);
+            
+            if (count == 0) return false; // Contradiction : case vide sans options
+            
+            if (count < min_choices) {
+                min_choices = count;
+                best_r = r;
+                best_c = c;
+                cand_mask = cands;
+                if (count == 1) goto skip_search; // Optimisation : Naked Single trouvé
+            }
+        }
+    }
+
+skip_search:
+    if (best_r == -1) return true; // La grille est complète
+
+    // ÉTAPE 2 : EXPLORATION
+    // On parcourt les bits à 1 du masque (les candidats valides)
+    while (cand_mask) {
+        int bit = cand_mask & -cand_mask; // Isole le bit le plus bas
+        int v = __builtin_ctz(bit) + 1;   // Convertit le bit en valeur (1-9)
+        cand_mask ^= bit;                 // Retire le bit pour l'itération suivante
+
+        // Application du choix
+        board[best_r][best_c] = v;
+        m.update(best_r, best_c, v, true);
+
+        // Récursion
+        if (solve_infandoku_v1(board, m)) return true;
+
+        // Backtrack (Annulation)
+        m.update(best_r, best_c, v, false);
+        board[best_r][best_c] = 0;
+    }
+
+    return false;
+}
+
+// ── UTILITAIRES ──────────────────────────────────────────────────────────
+
+void print_board(const Board& b) {
+    for (int r = 0; r < 9; r++) {
+        if (r % 3 == 0 && r != 0) std::cout << "------+-------+------\n";
+        for (int c = 0; c < 9; c++) {
+            if (c % 3 == 0 && c != 0) std::cout << "| ";
+            std::cout << (b[r][c] == 0 ? "." : std::to_string(b[r][c])) << " ";
+        }
+        std::cout << "\n";
+    }
+}
+
+int main() {
+    Board grid = {}; // Initialisation à zéro (grille vide)
+    Masks m;
+    m.init(grid);
+
+    std::cout << "Génération d'une grille complète via Infandoku v1...\n\n";
+    
+    auto start = std::chrono::high_resolution_clock::now();
+    
+    if (solve_infandoku_v1(grid, m)) {
+        auto end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double, std::micro> diff = end - start;
+        
+        print_board(grid);
+        std::cout << "\nTemps de génération : " << diff.count() << " us\n";
+    } else {
+        std::cout << "Erreur de génération.\n";
+    }
+
+    return 0;
+}
