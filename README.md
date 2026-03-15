@@ -1,2 +1,2 @@
-# Infandoku-v-35
+# Infandoku 
 Ultra-fast Sudoku Solver
