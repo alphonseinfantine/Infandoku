@@ -1,0 +1,117 @@
+#include <iostream>
+#include <array>
+#include <vector>
+#include <algorithm>
+#include <cstring>
+
+// ── INFANDOKU V3 ── DEFINITIONS & TYPES ──────────────────────────────────
+
+using Board = std::array<std::array<int, 9>, 9>;
+
+// Fast bit manipulation using CPU built-ins
+inline int popcount(int x) { return __builtin_popcount(x); }
+inline int lowest_bit(int x) { return __builtin_ctz(x); }
+
+// ── MASK & CANDIDATE MANAGEMENT ──────────────────────────────────────────
+
+struct Masks {
+    int rows[9] = {}, cols[9] = {}, blks[9] = {};
+    int cands[9][9] = {};
+
+    // Initialize structures from a given board state
+    void init(const Board& b) {
+        memset(rows, 0, sizeof(rows)); 
+        memset(cols, 0, sizeof(cols)); 
+        memset(blks, 0, sizeof(blks));
+
+        for (int r = 0; r < 9; r++)
+            for (int c = 0; c < 9; c++)
+                if (b[r][c]) update(r, c, b[r][c], true);
+        
+        for (int r = 0; r < 9; r++)
+            for (int c = 0; c < 9; c++)
+                cands[r][c] = b[r][c] ? 0 : (~(rows[r] | cols[c] | blks[(r / 3) * 3 + (c / 3)])) & 0x1FF;
+    }
+
+    inline void update(int r, int c, int v, bool set) {
+        int bit = 1 << (v - 1);
+        if (set) {
+            rows[r] |= bit; cols[c] |= bit; blks[(r / 3) * 3 + (c / 3)] |= bit;
+        } else {
+            rows[r] &= ~bit; cols[c] &= ~bit; blks[(r / 3) * 3 + (c / 3)] &= ~bit;
+        }
+    }
+
+    // Place a value and update candidate lists for neighbors
+    inline void place(int r, int c, int v, Board& b) {
+        b[r][c] = v; 
+        update(r, c, v, true);
+        int bit = 1 << (v - 1);
+        int br = r / 3 * 3, bc = c / 3 * 3;
+        
+        for (int i = 0; i < 9; i++) {
+            cands[r][i] &= ~bit;
+            cands[i][c] &= ~bit;
+            cands[br + i / 3][bc + i % 3] &= ~bit;
+        }
+        cands[r][c] = 0;
+    }
+};
+
+// ── LOGICAL PROPAGATION ──────────────────────────────────────────────────
+
+// Automatically fills "Naked Singles"
+bool propagate(Board& b, Masks& m) {
+    bool progress = true;
+    while (progress) {
+        progress = false;
+        for (int r = 0; r < 9; r++) {
+            for (int c = 0; c < 9; c++) {
+                if (b[r][c] || popcount(m.cands[r][c]) != 1) continue;
+                m.place(r, c, lowest_bit(m.cands[r][c]) + 1, b);
+                progress = true;
+            }
+        }
+    }
+    for (int r = 0; r < 9; r++)
+        for (int c = 0; c < 9; c++)
+            if (!b[r][c] && m.cands[r][c] == 0) return false;
+
+    return true;
+}
+
+// ── BACKTRACKING ENGINE (MRV) ────────────────────────────────────────────
+
+bool solve_infandoku_v3(Board& b, Masks& m) {
+    if (!propagate(b, m)) return false;
+    
+    int br = -1, bc = -1, min_cnt = 10, bcands = 0;
+    for (int r = 0; r < 9; r++) {
+        for (int c = 0; c < 9; c++) {
+            if (b[r][c]) continue;
+            int cnt = popcount(m.cands[r][c]);
+            if (cnt < min_cnt) { 
+                min_cnt = cnt; br = r; bc = c; bcands = m.cands[r][c]; 
+            }
+        }
+    }
+
+    if (br == -1) return true;
+
+    Board sb = b; 
+    Masks sm = m;
+    int tmp = bcands;
+
+    while (tmp) {
+        int bit = tmp & (-tmp);
+        tmp &= tmp - 1;
+        
+        m.place(br, bc, lowest_bit(bit) + 1, b);
+        if (solve_infandoku_v3(b, m)) return true;
+        
+        b = sb; 
+        m = sm;
+    }
+
+    return false;
+}
