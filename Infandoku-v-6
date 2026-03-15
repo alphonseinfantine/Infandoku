@@ -1,0 +1,239 @@
+#include <iostream>
+#include <array>
+#include <chrono>
+#include <cstring>
+#include <functional>
+#include <vector>
+#include <cmath>
+
+// ── INFANDOKU 6 ── PRE-CALCULATED TABLES ──────────────────────────────────
+
+using Board = std::array<std::array<int,9>,9>;
+inline int popcount(int x){return __builtin_popcount(x);}
+inline int ctz(int x){return __builtin_ctz(x);}
+
+struct Tables {
+    int row[81],col[81],blk[81];
+    int neighbors[81][20];
+    int zones[27][9];
+    int cell_zones[81][3];
+    void build(){
+        for(int r=0;r<9;r++) for(int c=0;c<9;c++){
+            int idx=r*9+c; row[idx]=r; col[idx]=c; blk[idx]=(r/3)*3+(c/3);}
+        for(int r=0;r<9;r++) for(int c=0;c<9;c++) zones[r][c]=r*9+c;
+        for(int c=0;c<9;c++) for(int r=0;r<9;r++) zones[9+c][r]=r*9+c;
+        for(int b=0;b<9;b++){int br=b/3*3,bc=b%3*3,i=0;
+            for(int dr=0;dr<3;dr++) for(int dc=0;dc<3;dc++)
+                zones[18+b][i++]=(br+dr)*9+(bc+dc);}
+        for(int idx=0;idx<81;idx++){
+            cell_zones[idx][0]=row[idx]; cell_zones[idx][1]=9+col[idx]; cell_zones[idx][2]=18+blk[idx];}
+        for(int idx=0;idx<81;idx++){
+            bool seen[81]={}; seen[idx]=true; int n=0;
+            int r=row[idx],c=col[idx],br=r/3*3,bc=c/3*3;
+            for(int i=0;i<9;i++){
+                int a=r*9+i,b2=i*9+c,bl=(br+i/3)*9+(bc+i%3);
+                if(!seen[a]){seen[a]=true;neighbors[idx][n++]=a;}
+                if(!seen[b2]){seen[b2]=true;neighbors[idx][n++]=b2;}
+                if(!seen[bl]){seen[bl]=true;neighbors[idx][n++]=bl;}}}
+    }
+} T;
+
+struct Stats{ long long nodes=0,ns=0,hs=0,np=0; };
+
+// ── STATE ────────────────────────────────────────────────────────────────
+
+struct State {
+    int board[81]={},cands[81]={};
+    int rows[9]={},cols[9]={},blks[9]={};
+    int zone_placed[27]={}, empty=0;
+
+    void init(const Board& b){
+        memset(this,0,sizeof(*this));
+        for(int r=0;r<9;r++) for(int c=0;c<9;c++){
+            int v=b[r][c],idx=r*9+c; board[idx]=v;
+            if(v){int bit=1<<(v-1);
+                rows[r]|=bit; cols[c]|=bit; blks[T.blk[idx]]|=bit;
+                for(int zi=0;zi<3;zi++) zone_placed[T.cell_zones[idx][zi]]|=bit;}
+            else empty++;}
+        for(int idx=0;idx<81;idx++) if(!board[idx]){
+            int r=T.row[idx],c=T.col[idx];
+            cands[idx]=(~(rows[r]|cols[c]|blks[T.blk[idx]]))&0x1FF;}
+    }
+
+    inline bool place(int idx,int v){
+        int bit=1<<(v-1); board[idx]=v; cands[idx]=0; empty--;
+        rows[T.row[idx]]|=bit; cols[T.col[idx]]|=bit; blks[T.blk[idx]]|=bit;
+        for(int zi=0;zi<3;zi++) zone_placed[T.cell_zones[idx][zi]]|=bit;
+        for(int i=0;i<20;i++){int nb=T.neighbors[idx][i];
+            if(!board[nb]){cands[nb]&=~bit; if(!cands[nb]) return false;}}
+        return true;}
+};
+
+// ── GRID ANALYZER (DISPATCHER) ──────────────────────────────────────────
+
+struct GridProfile {
+    int filled, min_cands, singles_count, pairs_count;
+    float avg_cands, entropy, info_density;
+    enum Strategy { PURE_MRV, MRV_HS, FULL_PROPAGATION, LOGIC_FIRST } strategy;
+
+    std::string strategy_name() const {
+        switch(strategy){
+            case PURE_MRV: return "PURE_MRV (empty grid)";
+            case MRV_HS: return "MRV + Hidden Singles";
+            case FULL_PROPAGATION: return "Full Propagation (NS+HS+NP)";
+            case LOGIC_FIRST: return "Logic First (high singles)";
+        }
+        return "?";
+    }
+};
+
+
+
+GridProfile analyze(const Board& b){
+    GridProfile p={}; State st; st.init(b);
+    p.filled = 81 - st.empty;
+    int total_cands=0, count=0, dist[10]={};
+    p.min_cands=10;
+    for(int idx=0;idx<81;idx++){
+        if(st.board[idx]) continue;
+        int cnt=popcount(st.cands[idx]);
+        if(cnt<p.min_cands) p.min_cands=cnt;
+        total_cands+=cnt; count++;
+        if(cnt<=9) dist[cnt]++;
+    }
+    p.avg_cands = count ? (float)total_cands/count : 0;
+    float ent=0;
+    for(int i=1;i<=9;i++){
+        if(!dist[i]) continue;
+        float pr=(float)dist[i]/count;
+        ent -= pr * log2f(pr);
+    }
+    p.entropy = ent;
+    p.singles_count = dist[1]; p.pairs_count = dist[2];
+    p.info_density = (float)p.filled / 81.0f;
+
+    if(p.avg_cands > 5.5f && p.singles_count == 0) p.strategy = GridProfile::PURE_MRV;
+    else if(p.singles_count > 5 || (p.pairs_count > 8 && p.filled > 25)) p.strategy = GridProfile::LOGIC_FIRST;
+    else if(p.avg_cands < 4.5f || p.filled > 35) p.strategy = GridProfile::FULL_PROPAGATION;
+    else p.strategy = GridProfile::MRV_HS;
+    return p;
+}
+
+// ── PROPAGATION MODULES ──────────────────────────────────────────────────
+
+int naked_singles(State& st, Stats& s){
+    bool p=true; while(p){ p=false; if(!st.empty) return -2;
+    for(int idx=0;idx<81;idx++){
+        if(st.board[idx]) continue;
+        int cnd=st.cands[idx]; if(!cnd) return idx;
+        if(popcount(cnd)==1){
+            if(!st.place(idx,ctz(cnd)+1)) return idx;
+            s.ns++; p=true; if(!st.empty) return -2;}}}
+    return -1;
+}
+
+int hidden_singles(State& st, Stats& s){
+    bool found=true; while(found){ found=false;
+    for(int z=0;z<27;z++){
+        int miss=(~st.zone_placed[z])&0x1FF, tmp=miss;
+        while(tmp){ int bit=tmp&(-tmp); tmp&=tmp-1; int v=ctz(bit)+1;
+            int pos=-1,cnt=0;
+            for(int k=0;k<9;k++){int idx=T.zones[z][k];
+                if(!st.board[idx]&&(st.cands[idx]&bit)){pos=idx;cnt++;}}
+            if(!cnt) return pos;
+            if(cnt==1){
+                if(!st.place(pos,v)) return pos;
+                s.hs++; found=true;
+                int r=naked_singles(st,s);
+                if(r==-2) return -2; if(r>=0) return r;}}}}
+    return -1;
+}
+
+int naked_pairs(State& st, Stats& s){
+    int total=0;
+    for(int z=0;z<27;z++){
+        int pc=0,pidx[9],pcnd[9];
+        for(int k=0;k<9;k++){int idx=T.zones[z][k];
+            if(!st.board[idx]&&popcount(st.cands[idx])==2)
+            {pidx[pc]=idx;pcnd[pc]=st.cands[idx];pc++;}}
+        for(int i=0;i<pc;i++) for(int j=i+1;j<pc;j++){
+            if(pcnd[i]!=pcnd[j]) continue; int mask=pcnd[i];
+            for(int k=0;k<9;k++){int idx=T.zones[z][k];
+                if(idx==pidx[i]||idx==pidx[j]) continue;
+                if(!st.board[idx]&&(st.cands[idx]&mask))
+                {st.cands[idx]&=~mask; s.np++; total++;}}}}
+    return total;
+}
+
+bool prop_ns_hs(State& st, Stats& s){
+    while(true){
+        int before=st.empty;
+        int r=naked_singles(st,s); if(r==-2) return true; if(r>=0) return false;
+        r=hidden_singles(st,s); if(r==-2) return true; if(r>=0) return false;
+        if(st.empty==before) return true;}}
+
+bool prop_full(State& st, Stats& s){
+    while(true){
+        int before=st.empty;
+        int r=naked_singles(st,s); if(r==-2) return true; if(r>=0) return false;
+        r=hidden_singles(st,s); if(r==-2) return true; if(r>=0) return false;
+        if(st.empty==before){
+            int elim=naked_pairs(st,s);
+            if(!elim) return true;
+            r=naked_singles(st,s); if(r==-2) return true; if(r>=0) return false;
+            r=hidden_singles(st,s); if(r==-2) return true; if(r>=0) return false;
+            if(st.empty==before) return true;}}}
+
+inline int entropy_score(int idx, int v, const State& st){
+    int score=0, bit=1<<(v-1);
+    for(int i=0;i<20;i++){int nb=T.neighbors[idx][i];
+        if(!st.board[nb]){
+            int after=st.cands[nb]&~bit, cnt=popcount(after);
+            if(cnt==1) score+=4; else if(cnt==2) score+=2; else if(cnt==3) score+=1;}}
+    return score;}
+
+// ── GENERIC SOLVER & DISPATCHER ──────────────────────────────────────────
+
+using PropFn = bool(*)(State&,Stats&);
+
+bool solve_generic(State& st, Stats& s, PropFn prop, bool zone_min){
+    if(!prop(st,s)) return false;
+    if(!st.empty) return true;
+    int bi=-1,bcands=0,mc=10,bz=(zone_min?100:-1);
+    for(int idx=0;idx<81;idx++){if(st.board[idx]) continue;
+        int cnd=st.cands[idx]; if(!cnd) return false;
+        int cnt=popcount(cnd);
+        int zs=popcount(st.rows[T.row[idx]])+popcount(st.cols[T.col[idx]])+popcount(st.blks[T.blk[idx]]);
+        if(cnt<mc||(cnt==mc&&(zone_min ? zs<bz : zs>bz))){mc=cnt;bi=idx;bcands=cnd;bz=zs;}}
+    if(bi<0) return true; s.nodes++;
+    int vals[9],scores[9],nv=0,tmp=bcands;
+    while(tmp){int bit=tmp&(-tmp); tmp&=tmp-1; int v=ctz(bit)+1;
+        vals[nv]=v; scores[nv]=entropy_score(bi,v,st); nv++;}
+    for(int i=1;i<nv;i++){int kv=vals[i],ks=scores[i],j=i-1;
+        while(j>=0&&scores[j]<ks){vals[j+1]=vals[j];scores[j+1]=scores[j];j--;}
+        vals[j+1]=kv; scores[j+1]=ks;}
+    State sv=st;
+    for(int i=0;i<nv;i++){st.place(bi,vals[i]);
+        if(solve_generic(st,s,prop,zone_min)) return true; st=sv;}
+    return false;}
+
+bool solve_mrv(State& st, Stats& s){
+    int r=naked_singles(st,s); if(r==-2) return true; if(r>=0) return false;
+    int bi=-1,bcands=0,mc=10;
+    for(int idx=0;idx<81;idx++){if(st.board[idx]) continue;
+        int cnd=st.cands[idx],cnt=popcount(cnd);
+        if(!cnt) return false; if(cnt<mc){mc=cnt;bi=idx;bcands=cnd;}}
+    if(bi<0) return true; s.nodes++;
+    State sv=st; int tmp=bcands;
+    while(tmp){int bit=tmp&(-tmp); tmp&=tmp-1;
+        st.place(bi,ctz(bit)+1); if(solve_mrv(st,s)) return true; st=sv;}
+    return false;}
+
+bool solve_dispatch(State& st, Stats& s, const GridProfile& p){
+    switch(p.strategy){
+        case GridProfile::PURE_MRV: return solve_mrv(st,s);
+        case GridProfile::MRV_HS: return solve_generic(st,s, prop_ns_hs, true);
+        case GridProfile::FULL_PROPAGATION: return solve_generic(st,s, prop_full, true);
+        case GridProfile::LOGIC_FIRST: return solve_generic(st,s, prop_full, false);
+    } return false;
+}
