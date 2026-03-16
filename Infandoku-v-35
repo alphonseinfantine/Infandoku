@@ -1,0 +1,70 @@
+// ════════════════════════════════════════════════════════════════════
+//  SUDOKU SOLVER - ARCHITECTURE MONOBLOC
+//  Structure optimisée pour performance et maintenance
+// ════════════════════════════════════════════════════════════════════
+
+#include <iostream>
+#include <array>
+#include <vector>
+#include <algorithm>
+#include <chrono>
+#include <immintrin.h>
+#include <cstring>
+
+// ── SECTION 1 : UTILITAIRES ET TABLES PRÉCALCULÉES ──────────────────
+
+struct Tables {
+    // Définitions des tables de correspondance (ex: cell_blk, blk_row...)
+    void build() {
+        // Logique de précalcul
+    }
+} T;
+
+// 
+
+// ── SECTION 2 : ÉTAT DU JEU (BITBOARDS) ─────────────────────────────
+
+struct State {
+    int board[81];
+    uint16_t rows[9], cols[9], blks[9];
+    
+    // Méthodes de manipulation de bits
+    inline int cv(int r, int c) const { /* ... */ }
+    inline bool place(int r, int c, int v) { /* ... */ }
+};
+
+// ── SECTION 3 : MOTEUR D'INFÉRENCE (PROPAGATION) ────────────────────
+
+// Naked Singles : Recherche de cases avec un seul candidat
+int do_ns(State& st) { /* ... */ }
+
+// Hidden Singles : Recherche via AVX2 pour performance accrue
+int do_hs(State& st) { /* ... */ }
+
+// 
+
+// ── SECTION 4 : MOTEUR DE RECHERCHE (BACKTRACKING) ──────────────────
+
+// Heuristiques (Entropie, MRV, etc.)
+inline int entropy_score(int r, int c, int v, const State& st) { /* ... */ }
+
+// Fonction récursive de résolution
+bool solve(State& st) {
+    // Dispatcher intelligent (basé sur le nombre d'indices)
+}
+
+// ── SECTION 5 : INTERFACES ET ENTRÉES/SORTIES ───────────────────────
+
+void print_grid(const State& st) { /* ... */ }
+
+void run_puzzle(const std::string& puz) { /* ... */ }
+
+void interactive_mode() { /* ... */ }
+
+// ── SECTION 6 : POINT D'ENTRÉE (MAIN) ────────────────────────────────
+
+int main(int argc, char* argv[]) {
+    T.build();
+    // Gestion des modes (Fichier, Stdin, Interactif)
+    return 0;
+}
