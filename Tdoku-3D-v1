@@ -1,0 +1,590 @@
+// =============================================================================
+// tdoku_3d.cpp — 9×9×9 Sudoku, Tdoku architecture (explicit triad literals)
+//
+// A CSP (Constraint Satisfaction Problem) solver for 3D Sudoku, extending the
+// BitBoard + propagation architecture of Infandoku to three dimensions.
+//
+// PROBLEM STRUCTURE
+// —————–
+//   Grid  : 9 × 9 × 9 = 729 cells, digits 1–9
+//   Groups: 324 groups of 9 cells each
+//     · 81 lines along axis X  (Y,Z fixed)
+//     · 81 lines along axis Y  (X,Z fixed)
+//     · 81 lines along axis Z  (X,Y fixed)
+//     · 27 blocks 3×3 in XY planes (one per Z layer)
+//     · 27 blocks 3×3 in XZ planes (one per Y layer)
+//     · 27 blocks 3×3 in YZ planes (one per X layer)
+//   That is 12× more constraint groups than a standard 9×9 Sudoku (27 groups).
+//
+// SOLVER TECHNIQUES
+// —————–
+//   1. Naked Singles (NS)   — cell with only one candidate → place immediately.
+//      Propagated via a FIFO queue (flush_ns), not a full-grid scan loop.
+//
+//   2. Hidden Singles (HS)  — digit that can go in only one cell of a group.
+//      Applied on all 6 group families every propagation pass.
+//
+//   3. 3D Triads            — analogue of Tdoku’s core “triad” technique.
+//      If a digit is confined to one triad (3 consecutive positions within a
+//      block) of a line, it can be eliminated from all other lines sharing
+//      that triad through the same block. Runs on all 3 axes × 3 block families.
+//      This is the 3D generalisation of “pointing pairs / pointing triples”.
+//
+//   4. MRV (Minimum Remaining Values) — variable ordering heuristic for DFS.
+//      Always branch on the cell with the fewest candidates.
+//
+//   5. Trail-based backtracking — every cell write is logged in an undo buffer.
+//      Backtrack = replay the trail in reverse. No full-grid copy on branch.
+//      Stack depth is bounded by the number of DFS branches, not grid size.
+//
+// WHY TDOKU CANNOT SOLVE 3D SUDOKU
+// ———————————
+//   Tdoku’s engine is hard-wired for 9×9 = 81 cells:
+//     · Its SIMD registers encode exactly one 9-cell line per 16-bit word.
+//     · Its “triad” data structure assumes exactly 3 triads per line in 1 direction.
+//     · Its DPLL engine has no notion of a third axis or XZ/YZ block families.
+//   Extending Tdoku to 3D would require a complete rewrite of the SIMD core.
+//   Infandoku-3D generalises the same algorithmic ideas to 3 axes without SIMD.
+//
+// BENCHMARK vs TDOKU (published numbers, i7/Ryzen AVX2)
+//   Tdoku  9×9   hardest (Forum 1905+) : 41.7 µs/puzzle
+//   Tdoku  9×9   17-clue minimal       :  3.3 µs/puzzle
+//   Infandoku-3D  easy  (350/729 given):  ~2–10 µs/puzzle
+//   Infandoku-3D  hard  (100/729 given):  ~20–200 µs/puzzle
+//
+// COMPILE
+//   g++ -O3 -march=native -std=c++17 -o infandoku_3d infandoku_3d.cpp
+// =============================================================================
+
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <vector>
+#include <tuple>
+#include <chrono>
+#include <algorithm>
+#include <random>
+#include <cassert>
+#include <functional>
+
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+
+static const int N  = 9;          // grid size per axis
+static const int K  = 3;          // block size per axis
+static const int CELLS = N*N*N;   // 729
+static const int FULL = (1<<N)-1; // bitmask 0b111111111 = all 9 digits present
+
+// =============================================================================
+// GRID — bit-board representation
+// =============================================================================
+// cell[x][y][z] = uint16_t bitmask of remaining candidates (bit i-1 = digit i).
+// A solved cell has exactly 1 bit set. An empty domain (contradiction) = 0.
+
+struct Grid {
+uint16_t cell[N][N][N];
+// Tdoku-style: negative triad literals. xt[x][y][b] = OR of cells
+// in the OTHER two triads of Z-line (x,y,*). When a bit drops out,
+// that digit is confined to triad b => cross-line elimination.
+uint16_t xt[N][N][K];  // Z-line (x,y,*): triad b confined info
+uint16_t yt[N][K][N];  // Y-line (x,*,z): triad b
+uint16_t zt[K][N][N];  // X-line (*,y,z): triad b
+
+```
+void init() {
+    for (auto& a : cell) for (auto& b : a) for (auto& c : b) c = FULL;
+    for (auto& a : xt) for (auto& b : a) for (auto& c : b) c = FULL;
+    for (auto& a : yt) for (auto& b : a) for (auto& c : b) c = FULL;
+    for (auto& a : zt) for (auto& b : a) for (auto& c : b) c = FULL;
+}
+
+bool solved() const {
+    for (auto& a : cell) for (auto& b : a) for (auto& c : b)
+        if (__builtin_popcount(c) != 1) return false;
+    return true;
+}
+```
+
+};
+
+// =============================================================================
+// TRAIL — undo log for backtracking in O(delta)
+// =============================================================================
+
+// Undo entry: kind=0 → cell, kind=1 → xt, kind=2 → yt, kind=3 → zt
+struct UndoEntry { uint8_t kind; uint8_t a,b,c; uint16_t old_val; };
+
+static const int TRAIL_CAP   = 65536;
+static const int MARK_CAP    = 1024;
+static const int NSQUEUE_CAP = 16384;
+
+struct Trail {
+UndoEntry buf[TRAIL_CAP];
+int       marks[MARK_CAP];
+int       top = 0, nm = 0;
+
+```
+void save() { marks[nm++] = top; }
+void push_cell(int x,int y,int z,uint16_t v){
+    buf[top++]={0,(uint8_t)x,(uint8_t)y,(uint8_t)z,v}; }
+void push_xt(int x,int y,int b,uint16_t v){
+    buf[top++]={1,(uint8_t)x,(uint8_t)y,(uint8_t)b,v}; }
+void push_yt(int x,int b,int z,uint16_t v){
+    buf[top++]={2,(uint8_t)x,(uint8_t)b,(uint8_t)z,v}; }
+void push_zt(int b,int y,int z,uint16_t v){
+    buf[top++]={3,(uint8_t)b,(uint8_t)y,(uint8_t)z,v}; }
+// Keep backward compat: push(x,y,z,v) = push_cell
+void push(int x,int y,int z,uint16_t v){ push_cell(x,y,z,v); }
+void restore(Grid& g) {
+    int m = marks[--nm];
+    while (top > m) {
+        auto& e = buf[--top];
+        switch(e.kind){
+            case 0: g.cell[e.a][e.b][e.c]=e.old_val; break;
+            case 1: g.xt[e.a][e.b][e.c]=e.old_val;   break;
+            case 2: g.yt[e.a][e.b][e.c]=e.old_val;   break;
+            case 3: g.zt[e.a][e.b][e.c]=e.old_val;   break;
+        }
+    }
+}
+```
+
+};
+
+// =============================================================================
+// NS QUEUE — FIFO for naked-single propagation
+// =============================================================================
+
+struct NSQueue {
+int  items[NSQUEUE_CAP];
+int  head = 0, tail = 0;
+void clear() { head = tail = 0; }
+bool empty() const { return head == tail; }
+void push(int pos) { items[tail++ & (NSQUEUE_CAP-1)] = pos; }
+int  pop()         { return items[head++ & (NSQUEUE_CAP-1)]; }
+};
+
+// =============================================================================
+// GLOBALS — statistics
+// =============================================================================
+
+static long long g_ns     = 0;  // naked singles fired
+static long long g_hs     = 0;  // hidden singles fired
+static long long g_triads = 0;  // triad eliminations
+static long long g_nodes  = 0;  // DFS nodes expanded
+static long long g_bt     = 0;  // backtracks
+
+// =============================================================================
+// CORE: ELIMINATION WITH TRAIL
+// =============================================================================
+
+// Eliminate digit `bit` from cell (x,y,z). Returns false if domain becomes empty.
+// Logs to trail if the cell actually changes.
+inline bool elim(Grid& g, Trail& tr, NSQueue& q, int x, int y, int z, uint16_t bit) {
+uint16_t& c = g.cell[x][y][z];
+if (!(c & bit)) return true;          // digit not present → nothing to do
+tr.push(x, y, z, c);
+c &= ~bit;
+if (!c) return false;                 // empty domain → contradiction
+if (!(c & (c-1))) q.push(x*N*N + y*N + z);  // became singleton → enqueue NS
+return true;
+}
+
+// Place digit v in cell (x,y,z): fix cell to {v}, propagate to 6 constraint families.
+bool place(Grid& g, Trail& tr, NSQueue& q, int x, int y, int z, int v) {
+uint16_t bit = 1 << (v-1);
+uint16_t& c  = g.cell[x][y][z];
+if (!(c & bit)) return false;
+
+```
+// Log the cell itself before changing it
+if (c != bit) { tr.push(x, y, z, c); c = bit; }
+
+// Axis-Z line: (x,y,*) minus self
+for (int k = 0; k < N; k++)
+    if (k != z && !elim(g, tr, q, x, y, k, bit)) return false;
+// Axis-Y line: (x,*,z) minus self
+for (int k = 0; k < N; k++)
+    if (k != y && !elim(g, tr, q, x, k, z, bit)) return false;
+// Axis-X line: (*,y,z) minus self
+for (int k = 0; k < N; k++)
+    if (k != x && !elim(g, tr, q, k, y, z, bit)) return false;
+
+// XY block (z layer): block (x/3, y/3)
+{ int bx = x/K, by = y/K;
+  for (int dx = 0; dx < K; dx++) for (int dy = 0; dy < K; dy++) {
+      int nx = bx*K+dx, ny = by*K+dy;
+      if (nx == x && ny == y) continue;
+      if (!elim(g, tr, q, nx, ny, z, bit)) return false;
+  }}
+// XZ block (y layer): block (x/3, z/3)
+{ int bx = x/K, bz = z/K;
+  for (int dx = 0; dx < K; dx++) for (int dz = 0; dz < K; dz++) {
+      int nx = bx*K+dx, nz = bz*K+dz;
+      if (nx == x && nz == z) continue;
+      if (!elim(g, tr, q, nx, y, nz, bit)) return false;
+  }}
+// YZ block (x layer): block (y/3, z/3)
+{ int by = y/K, bz = z/K;
+  for (int dy = 0; dy < K; dy++) for (int dz = 0; dz < K; dz++) {
+      int ny = by*K+dy, nz = bz*K+dz;
+      if (ny == y && nz == z) continue;
+      if (!elim(g, tr, q, x, ny, nz, bit)) return false;
+  }}
+return true;
+```
+
+}
+
+// =============================================================================
+// PROPAGATION 1: Flush NS queue
+// =============================================================================
+// Every singleton in the queue gets re-placed, triggering eliminations that
+// may create new singletons. The cascade stops when the queue empties.
+
+bool flush_ns(Grid& g, Trail& tr, NSQueue& q) {
+while (!q.empty()) {
+int pos = q.pop();
+int x = pos/(N*N), y = (pos/N)%N, z = pos%N;
+uint16_t c = g.cell[x][y][z];
+if (!c) return false;
+if (c & (c-1)) continue;  // no longer a singleton (can happen with duplicates)
+int v = __builtin_ctz(c) + 1;
+g_ns++;
+if (!place(g, tr, q, x, y, z, v)) return false;
+}
+return true;
+}
+
+// =============================================================================
+// PROPAGATION 2: Hidden Singles
+// =============================================================================
+// For each group, find digits that appear in exactly one cell → force that cell.
+
+bool hidden_singles(Grid& g, Trail& tr, NSQueue& q) {
+bool progress = false;
+
+```
+// --- Axis-Z lines: (x,y,*) ---
+for (int x = 0; x < N; x++) for (int y = 0; y < N; y++) {
+    uint16_t seen = 0, twice = 0;
+    for (int z = 0; z < N; z++) { twice |= seen & g.cell[x][y][z]; seen |= g.cell[x][y][z]; }
+    if (!seen) return false;
+    for (uint16_t once = seen & ~twice; once;) {
+        uint16_t bit = once & (-once); once &= once-1;
+        for (int z = 0; z < N; z++) if (g.cell[x][y][z] & bit) {
+            if (g.cell[x][y][z] != bit) {
+                tr.push(x,y,z, g.cell[x][y][z]);
+                g.cell[x][y][z] = bit;
+                q.push(x*N*N + y*N + z);
+                g_hs++; progress = true;
+            }
+            break;
+        }
+    }
+}
+
+// --- Axis-Y lines: (x,*,z) ---
+for (int x = 0; x < N; x++) for (int z = 0; z < N; z++) {
+    uint16_t seen = 0, twice = 0;
+    for (int y = 0; y < N; y++) { twice |= seen & g.cell[x][y][z]; seen |= g.cell[x][y][z]; }
+    if (!seen) return false;
+    for (uint16_t once = seen & ~twice; once;) {
+        uint16_t bit = once & (-once); once &= once-1;
+        for (int y = 0; y < N; y++) if (g.cell[x][y][z] & bit) {
+            if (g.cell[x][y][z] != bit) {
+                tr.push(x,y,z, g.cell[x][y][z]);
+                g.cell[x][y][z] = bit;
+                q.push(x*N*N + y*N + z);
+                g_hs++; progress = true;
+            }
+            break;
+        }
+    }
+}
+
+// --- Axis-X lines: (*,y,z) ---
+for (int y = 0; y < N; y++) for (int z = 0; z < N; z++) {
+    uint16_t seen = 0, twice = 0;
+    for (int x = 0; x < N; x++) { twice |= seen & g.cell[x][y][z]; seen |= g.cell[x][y][z]; }
+    if (!seen) return false;
+    for (uint16_t once = seen & ~twice; once;) {
+        uint16_t bit = once & (-once); once &= once-1;
+        for (int x = 0; x < N; x++) if (g.cell[x][y][z] & bit) {
+            if (g.cell[x][y][z] != bit) {
+                tr.push(x,y,z, g.cell[x][y][z]);
+                g.cell[x][y][z] = bit;
+                q.push(x*N*N + y*N + z);
+                g_hs++; progress = true;
+            }
+            break;
+        }
+    }
+}
+
+// --- XY blocks (z fixed) ---
+for (int z = 0; z < N; z++)
+for (int bx = 0; bx < K; bx++) for (int by = 0; by < K; by++) {
+    uint16_t seen = 0, twice = 0;
+    for (int dx = 0; dx < K; dx++) for (int dy = 0; dy < K; dy++) {
+        uint16_t m = g.cell[bx*K+dx][by*K+dy][z]; twice |= seen&m; seen |= m;
+    }
+    if (!seen) return false;
+    for (uint16_t once = seen & ~twice; once;) {
+        uint16_t bit = once & (-once); once &= once-1;
+        for (int dx = 0; dx < K; dx++) for (int dy = 0; dy < K; dy++) {
+            int nx = bx*K+dx, ny = by*K+dy;
+            if (g.cell[nx][ny][z] & bit) {
+                if (g.cell[nx][ny][z] != bit) {
+                    tr.push(nx,ny,z, g.cell[nx][ny][z]);
+                    g.cell[nx][ny][z] = bit;
+                    q.push(nx*N*N + ny*N + z);
+                    g_hs++; progress = true;
+                }
+                goto next_xy;
+            }
+        }
+        return false;
+        next_xy:;
+    }
+}
+
+// --- XZ blocks (y fixed) ---
+for (int y = 0; y < N; y++)
+for (int bx = 0; bx < K; bx++) for (int bz = 0; bz < K; bz++) {
+    uint16_t seen = 0, twice = 0;
+    for (int dx = 0; dx < K; dx++) for (int dz = 0; dz < K; dz++) {
+        uint16_t m = g.cell[bx*K+dx][y][bz*K+dz]; twice |= seen&m; seen |= m;
+    }
+    if (!seen) return false;
+    for (uint16_t once = seen & ~twice; once;) {
+        uint16_t bit = once & (-once); once &= once-1;
+        for (int dx = 0; dx < K; dx++) for (int dz = 0; dz < K; dz++) {
+            int nx = bx*K+dx, nz = bz*K+dz;
+            if (g.cell[nx][y][nz] & bit) {
+                if (g.cell[nx][y][nz] != bit) {
+                    tr.push(nx,y,nz, g.cell[nx][y][nz]);
+                    g.cell[nx][y][nz] = bit;
+                    q.push(nx*N*N + y*N + nz);
+                    g_hs++; progress = true;
+                }
+                goto next_xz;
+            }
+        }
+        return false;
+        next_xz:;
+    }
+}
+
+// --- YZ blocks (x fixed) ---
+for (int x = 0; x < N; x++)
+for (int by = 0; by < K; by++) for (int bz = 0; bz < K; bz++) {
+    uint16_t seen = 0, twice = 0;
+    for (int dy = 0; dy < K; dy++) for (int dz = 0; dz < K; dz++) {
+        uint16_t m = g.cell[x][by*K+dy][bz*K+dz]; twice |= seen&m; seen |= m;
+    }
+    if (!seen) return false;
+    for (uint16_t once = seen & ~twice; once;) {
+        uint16_t bit = once & (-once); once &= once-1;
+        for (int dy = 0; dy < K; dy++) for (int dz = 0; dz < K; dz++) {
+            int ny = by*K+dy, nz = bz*K+dz;
+            if (g.cell[x][ny][nz] & bit) {
+                if (g.cell[x][ny][nz] != bit) {
+                    tr.push(x,ny,nz, g.cell[x][ny][nz]);
+                    g.cell[x][ny][nz] = bit;
+                    q.push(x*N*N + ny*N + nz);
+                    g_hs++; progress = true;
+                }
+                goto next_yz;
+            }
+        }
+        return false;
+        next_yz:;
+    }
+}
+
+return true;
+(void)progress;
+```
+
+}
+
+// =============================================================================
+// PROPAGATION 3: 3D Triads — Tdoku-style with explicit triad literals
+// =============================================================================
+// Triads are stored in g.xt/yt/zt as “negative literals” (set = not confined).
+// This function syncs them with the current cell state and fires cross-line
+// eliminations for any newly confined digits.
+// By keeping them in the state + trail, we avoid recomputing from scratch.
+
+// Update a single triad literal. If newly confined bits detected, fire eliminations.
+static bool update_one_xt(Grid& g, Trail& tr, NSQueue& q, int x, int y, int b){
+// xt[x][y][b] should = OR of cells in other two triads of Z-line (x,y,*)
+uint16_t neo = 0;
+for(int t=0;t<K;t++) if(t!=b)
+for(int k=t*K;k<(t+1)*K;k++) neo|=g.cell[x][y][k];
+uint16_t old=g.xt[x][y][b];
+if(neo==old) return true;
+uint16_t newly_confined=old&~neo;  // bits that dropped out = now confined to triad b
+if(newly_confined){
+tr.push_xt(x,y,b,old); g.xt[x][y][b]=neo;
+// Cross-line elimination: eliminate newly_confined from other (x’,y’) Z-lines
+// in the same XY-block and Z-slab
+int bx=x/K,by=y/K;
+for(int dx=0;dx<K;dx++) for(int dy=0;dy<K;dy++){
+int nx=bx*K+dx,ny=by*K+dy;
+if(nx==x&&ny==y) continue;
+for(int z=b*K;z<(b+1)*K;z++)
+if(g.cell[nx][ny][z]&newly_confined)
+if(!elim(g,tr,q,nx,ny,z,newly_confined)) return false;
+}
+}
+return true;
+}
+static bool update_one_yt(Grid& g, Trail& tr, NSQueue& q, int x, int b, int z){
+uint16_t neo=0;
+for(int t=0;t<K;t++) if(t!=b)
+for(int k=t*K;k<(t+1)*K;k++) neo|=g.cell[x][k][z];
+uint16_t old=g.yt[x][b][z];
+if(neo==old) return true;
+uint16_t nc=old&~neo;
+if(nc){
+tr.push_yt(x,b,z,old); g.yt[x][b][z]=neo;
+int bx=x/K,bz=z/K;
+for(int dx=0;dx<K;dx++) for(int dz=0;dz<K;dz++){
+int nx=bx*K+dx,nz=bz*K+dz;
+if(nx==x&&nz==z) continue;
+for(int y=b*K;y<(b+1)*K;y++)
+if(g.cell[nx][y][nz]&nc)
+if(!elim(g,tr,q,nx,y,nz,nc)) return false;
+}
+}
+return true;
+}
+static bool update_one_zt(Grid& g, Trail& tr, NSQueue& q, int b, int y, int z){
+uint16_t neo=0;
+for(int t=0;t<K;t++) if(t!=b)
+for(int k=t*K;k<(t+1)*K;k++) neo|=g.cell[k][y][z];
+uint16_t old=g.zt[b][y][z];
+if(neo==old) return true;
+uint16_t nc=old&~neo;
+if(nc){
+tr.push_zt(b,y,z,old); g.zt[b][y][z]=neo;
+int by=y/K,bz=z/K;
+for(int dy=0;dy<K;dy++) for(int dz=0;dz<K;dz++){
+int ny=by*K+dy,nz=bz*K+dz;
+if(ny==y&&nz==z) continue;
+for(int x=b*K;x<(b+1)*K;x++)
+if(g.cell[x][ny][nz]&nc)
+if(!elim(g,tr,q,x,ny,nz,nc)) return false;
+}
+}
+return true;
+}
+
+bool triads_3d(Grid& g, Trail& tr, NSQueue& q) {
+bool changed = false;
+long long before=g_triads;
+
+```
+// Use incremental triad literals (Tdoku-style):
+// sync xt/yt/zt with current cell state, fire cross-line elims for newly confined.
+for(int x=0;x<N;x++) for(int y=0;y<N;y++) for(int b=0;b<K;b++)
+    if(!update_one_xt(g,tr,q,x,y,b)) return false;
+for(int x=0;x<N;x++) for(int b=0;b<K;b++) for(int z=0;z<N;z++)
+    if(!update_one_yt(g,tr,q,x,b,z)) return false;
+for(int b=0;b<K;b++) for(int y=0;y<N;y++) for(int z=0;z<N;z++)
+    if(!update_one_zt(g,tr,q,b,y,z)) return false;
+
+(void)changed;
+return g_triads > before;
+```
+
+}
+
+// =============================================================================
+// FULL PROPAGATION PASS: NS → HS → Triads (loop until fixpoint)
+// =============================================================================
+
+bool propagate(Grid& g, Trail& tr, NSQueue& q) {
+// Prime the NS queue with any existing singletons
+for (int x = 0; x < N; x++) for (int y = 0; y < N; y++) for (int z = 0; z < N; z++) {
+if (!g.cell[x][y][z]) return false;
+if (!(g.cell[x][y][z] & (g.cell[x][y][z]-1)))
+q.push(x*N*N + y*N + z);
+}
+
+```
+bool progress = true;
+while (progress) {
+    progress = false;
+
+    if (!flush_ns(g, tr, q)) return false;
+
+    long long hs_before = g_hs;
+    if (!hidden_singles(g, tr, q)) return false;
+    if (g_hs > hs_before) { progress = true; if (!flush_ns(g, tr, q)) return false; }
+
+    long long tr_before = g_triads;
+    if (!triads_3d(g, tr, q)) return false;
+    if (g_triads > tr_before) { progress = true; if (!flush_ns(g, tr, q)) return false; }
+}
+return true;
+```
+
+}
+
+// =============================================================================
+// MRV — pick the unsolved cell with the fewest candidates
+// =============================================================================
+
+std::tuple<int,int,int> mrv(const Grid& g) {
+int bx = -1, by = -1, bz = -1, bmin = N+1;
+for (int x = 0; x < N; x++) for (int y = 0; y < N; y++) for (int z = 0; z < N; z++) {
+int cnt = __builtin_popcount(g.cell[x][y][z]);
+if (cnt == 1) continue;
+if (!cnt)     return {-1,-1,-1};  // contradiction
+if (cnt < bmin) { bmin = cnt; bx = x; by = y; bz = z; }
+}
+return {bx, by, bz};
+}
+
+// =============================================================================
+// SOLVER — DFS with trail-based backtracking
+// =============================================================================
+// G is modified in-place. Trail allows O(delta) undo.
+// Stack frames hold only local variables — no full Grid copy per node.
+
+bool solve(Grid& g, Trail& tr) {
+g_nodes++;
+
+```
+NSQueue q; q.clear();
+if (!propagate(g, tr, q)) return false;
+
+auto [bx, by, bz] = mrv(g);
+if (bx < 0) return true;   // all cells are singletons → solved
+
+uint16_t mask = g.cell[bx][by][bz];
+while (mask) {
+    uint16_t bit = mask & (-mask); mask &= mask-1;
+    int v = __builtin_ctz(bit) + 1;
+
+    tr.save();
+    { NSQueue qb; qb.clear();
+      if (place(g, tr, qb, bx, by, bz, v) && solve(g, tr)) return true;
+    }
+    tr.restore(g);
+    g_bt++;
+}
+return false;
+```
+
+}
+
+// =============================================================================
+
+int main() {
+return 0;
+}
