@@ -1,0 +1,632 @@
+// ════════════════════════════════════════════════════════════════════
+//  Infandoku16 — High-performance 16x16 Sudoku Solver + Counter
+//  Author : A. Infantine (2026) — adapted from Infandoku v35
+//
+//  Architecture : BitBoard + Naked Singles + Hidden Singles + DFS
+//
+//  16x16 specifics :
+//    - 256 cells, 16 values, 4x4 blocks
+//    - 16-bit value bitmasks (vs 9-bit for 9x9)
+//    - 32-bit empty-cell bitmasks (16 cells per row/col/block)
+//    - __uint128_t for solution counting (avoids overflow)
+//
+//  Mode 1 : Solve a single 16x16 puzzle
+//  Mode 2 : Count all solutions with first block fixed to 1..16
+//           (S_fixed for the formula N_total = 16! × S_fixed)
+//
+//  Compilation :
+//    g++ -O3 -march=native -std=c++17 -o infandoku16 Infandoku16.cpp
+//
+//  Usage :
+//    ./infandoku16                  → interactive solver
+//    ./infandoku16 –count          → count S_fixed (WARNING: very long)
+//    ./infandoku16 –count –limit N → stop after N solutions (for testing)
+// ════════════════════════════════════════════════════════════════════
+
+#include <array>
+#include <chrono>
+#include <cstring>
+#include <cstdint>
+#include <iomanip>
+#include <iostream>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <unistd.h>
+
+// ── Constants ────────────────────────────────────────────────────────
+static const int N   = 16;          // grid size
+static const int N2  = N * N;       // 256 cells
+static const int NB  = 4;           // block size (4x4)
+static const int NBLK = N;          // number of blocks (16)
+static const int FULL_VAL  = 0xFFFF; // all 16 values placed
+static const int FULL_CELL = 0xFFFF; // all 16 cells empty
+
+inline int popcnt(int x)    { return __builtin_popcount(x); }
+inline int popcnt32(uint32_t x) { return __builtin_popcount(x); }
+inline int ctz(int x)       { return __builtin_ctz(x); }
+inline int ctz32(uint32_t x){ return __builtin_ctz(x); }
+
+// ════════════════════════════════════════════════════════════════════
+//  PART 1 — LOOKUP TABLES
+// ════════════════════════════════════════════════════════════════════
+
+struct Tables {
+int cell_blk[N][N];   // which 4x4 block does (r,c) belong to
+int cell_pos[N][N];   // position of (r,c) inside its block (0..15)
+int blk_row[NBLK][N]; // row of position p in block b
+int blk_col[NBLK][N]; // col of position p in block b
+
+```
+void build() {
+    for (int r = 0; r < N; r++) for (int c = 0; c < N; c++) {
+        cell_blk[r][c] = (r/NB)*NB + (c/NB);
+        cell_pos[r][c] = (r%NB)*NB + (c%NB);
+    }
+    for (int b = 0; b < NBLK; b++) for (int p = 0; p < N; p++) {
+        blk_row[b][p] = (b/NB)*NB + (p/NB);
+        blk_col[b][p] = (b%NB)*NB + (p%NB);
+    }
+}
+```
+
+} T;
+
+// ════════════════════════════════════════════════════════════════════
+//  PART 2 — GRID STATE
+//
+//  prow[r] : 16-bit mask of values placed in row r
+//  pcol[c] : 16-bit mask of values placed in col c
+//  pblk[b] : 16-bit mask of values placed in block b
+//
+//  rows[r] : 16-bit mask of EMPTY cells in row r (bit i = cell i empty)
+//  cols[c] : 16-bit mask of EMPTY cells in col c
+//  blks[b] : 16-bit mask of EMPTY cells in block b
+//
+//  cv(r,c) : returns 16-bit mask of legal values for cell (r,c)
+// ════════════════════════════════════════════════════════════════════
+
+struct State {
+int      board[N2]  = {};
+uint16_t rows[N]    = {};
+uint16_t cols[N]    = {};
+uint16_t blks[NBLK] = {};
+int      prow[N]    = {};
+int      pcol[N]    = {};
+int      pblk[NBLK] = {};
+int      empty         = 0;
+int      initial_clues = 0;
+
+```
+inline int cv(int r, int c) const {
+    return (~(prow[r] | pcol[c] | pblk[T.cell_blk[r][c]])) & FULL_VAL;
+}
+
+// Place value v (1-based) at (r,c). Returns false on contradiction.
+inline bool place(int r, int c, int v) {
+    int b  = T.cell_blk[r][c];
+    int p  = T.cell_pos[r][c];
+    int vb = 1 << (v - 1);
+    board[r*N + c] = v;
+    empty--;
+    prow[r] |= vb;  pcol[c] |= vb;  pblk[b] |= vb;
+    rows[r] &= ~(uint16_t)(1 << c);
+    cols[c] &= ~(uint16_t)(1 << r);
+    blks[b] &= ~(uint16_t)(1 << p);
+    // Contradiction check on neighbours
+    for (uint16_t fr = rows[r]; fr; fr &= fr-1) {
+        int fc = ctz(fr); if (!cv(r, fc)) return false;
+    }
+    for (uint16_t fc = cols[c]; fc; fc &= fc-1) {
+        int fr = ctz(fc); if (!cv(fr, c)) return false;
+    }
+    for (uint16_t fb = blks[b]; fb; fb &= fb-1) {
+        int pp = ctz(fb);
+        if (!cv(T.blk_row[b][pp], T.blk_col[b][pp])) return false;
+    }
+    return true;
+}
+
+bool valid() const {
+    for (int i = 0; i < N; i++)
+        if (prow[i] != FULL_VAL || pcol[i] != FULL_VAL) return false;
+    for (int b = 0; b < NBLK; b++)
+        if (pblk[b] != FULL_VAL) return false;
+    return !empty;
+}
+
+// Init from string. Values 1..16 encoded as hex: 1..9, A..G (or a..g)
+// 0 or '.' = empty cell. Expects exactly 256 valid chars.
+void init(const std::string& s) {
+    memset(this, 0, sizeof(*this));
+    for (int i = 0; i < N; i++)  rows[i] = cols[i] = FULL_CELL;
+    for (int b = 0; b < NBLK; b++) blks[b] = FULL_CELL;
+    int j = 0;
+    for (char ch : s) {
+        if (j >= N2) break;
+        int v = -1;
+        if (ch >= '1' && ch <= '9') v = ch - '0';
+        else if (ch >= 'A' && ch <= 'G') v = ch - 'A' + 10;
+        else if (ch >= 'a' && ch <= 'g') v = ch - 'a' + 10;
+        else if (ch == '0' || ch == '.') v = 0;
+        else continue; // skip separators
+        board[j] = v;
+        if (v) {
+            int r = j/N, cc = j%N, vb = 1 << (v-1);
+            int b = T.cell_blk[r][cc], p = T.cell_pos[r][cc];
+            prow[r] |= vb; pcol[cc] |= vb; pblk[b] |= vb;
+            rows[r] &= ~(uint16_t)(1 << cc);
+            cols[cc] &= ~(uint16_t)(1 << r);
+            blks[b]  &= ~(uint16_t)(1 << p);
+            initial_clues++;
+        } else empty++;
+        j++;
+    }
+}
+
+// Fix the first 4x4 block to 1..16 (canonical form for counting)
+// Returns false if contradiction.
+bool fix_first_block() {
+    for (int p = 0; p < N; p++) {
+        int r = T.blk_row[0][p];
+        int c = T.blk_col[0][p];
+        if (!place(r, c, p+1)) return false;
+    }
+    return true;
+}
+```
+
+};
+
+// ════════════════════════════════════════════════════════════════════
+//  PART 3 — NAKED SINGLES
+// ════════════════════════════════════════════════════════════════════
+
+int do_ns(State& st) {
+bool progress = true;
+while (progress) {
+progress = false;
+if (!st.empty) return -2;
+for (int r = 0; r < N; r++) {
+for (uint16_t fr = st.rows[r]; fr;) {
+int c = ctz(fr); fr &= fr-1;
+int cands = st.cv(r, c);
+if (!cands)              return r*N + c;
+if (!(cands & (cands-1))) {
+if (!st.place(r, c, ctz(cands)+1)) return r*N + c;
+progress = true;
+if (!st.empty) return -2;
+fr = st.rows[r];
+}
+}
+}
+}
+return -1;
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  PART 4 — HIDDEN SINGLES (scalar version for 16x16)
+//
+//  For each row/col/block and each missing value, check if only
+//  one cell can receive it. If so, place it immediately.
+// ════════════════════════════════════════════════════════════════════
+
+int do_hs(State& st) {
+bool found = true;
+while (found) {
+found = false;
+
+```
+    // ── Rows ─────────────────────────────────────────────────
+    for (int r = 0; r < N; r++) {
+        int miss = (~st.prow[r]) & FULL_VAL;
+        if (!miss || !st.rows[r]) continue;
+        for (int tmp = miss; tmp;) {
+            int vb = tmp & (-tmp); tmp &= tmp-1;
+            int v  = ctz(vb) + 1;
+            // Which columns in this row can receive v?
+            uint16_t avail = 0;
+            for (uint16_t fr = st.rows[r]; fr; fr &= fr-1) {
+                int c = ctz(fr);
+                if (!(st.pcol[c] & vb) && !(st.pblk[T.cell_blk[r][c]] & vb))
+                    avail |= (1 << c);
+            }
+            if (!avail) continue;
+            if (!(avail & (avail-1))) { // exactly one cell
+                int c = ctz(avail);
+                if (!st.place(r, c, v)) return r*N + c;
+                found = true;
+                int res = do_ns(st);
+                if (res == -2) return -2;
+                if (res >= 0)  return res;
+                miss = (~st.prow[r]) & FULL_VAL; tmp = miss;
+            }
+        }
+    }
+
+    // ── Columns ──────────────────────────────────────────────
+    for (int c = 0; c < N; c++) {
+        int miss = (~st.pcol[c]) & FULL_VAL;
+        if (!miss || !st.cols[c]) continue;
+        for (int tmp = miss; tmp;) {
+            int vb = tmp & (-tmp); tmp &= tmp-1;
+            int v  = ctz(vb) + 1;
+            uint16_t avail = 0;
+            for (uint16_t fc = st.cols[c]; fc; fc &= fc-1) {
+                int r = ctz(fc);
+                if (!(st.prow[r] & vb) && !(st.pblk[T.cell_blk[r][c]] & vb))
+                    avail |= (1 << r);
+            }
+            if (!avail) continue;
+            if (!(avail & (avail-1))) {
+                int r = ctz(avail);
+                if (!st.place(r, c, v)) return r*N + c;
+                found = true;
+                int res = do_ns(st);
+                if (res == -2) return -2;
+                if (res >= 0)  return res;
+                miss = (~st.pcol[c]) & FULL_VAL; tmp = miss;
+            }
+        }
+    }
+
+    // ── Blocks ───────────────────────────────────────────────
+    for (int b = 0; b < NBLK; b++) {
+        int miss = (~st.pblk[b]) & FULL_VAL;
+        if (!miss || !st.blks[b]) continue;
+        for (int tmp = miss; tmp;) {
+            int vb = tmp & (-tmp); tmp &= tmp-1;
+            int v  = ctz(vb) + 1;
+            uint16_t avail = 0;
+            for (uint16_t fb = st.blks[b]; fb; fb &= fb-1) {
+                int p = ctz(fb);
+                int r = T.blk_row[b][p], cc = T.blk_col[b][p];
+                if (!(st.prow[r] & vb) && !(st.pcol[cc] & vb))
+                    avail |= (1 << p);
+            }
+            if (!avail) continue;
+            if (!(avail & (avail-1))) {
+                int p = ctz(avail);
+                int r = T.blk_row[b][p], cc = T.blk_col[b][p];
+                if (!st.place(r, cc, v)) return r*N + cc;
+                found = true;
+                int res = do_ns(st);
+                if (res == -2) return -2;
+                if (res >= 0)  return res;
+                miss = (~st.pblk[b]) & FULL_VAL; tmp = miss;
+            }
+        }
+    }
+}
+return -1;
+```
+
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  PART 5 — PROPAGATION
+// ════════════════════════════════════════════════════════════════════
+
+bool prop(State& st) {
+while (true) {
+int before = st.empty;
+int r = do_ns(st); if (r == -2) return true; if (r >= 0) return false;
+r     = do_hs(st); if (r == -2) return true; if (r >= 0) return false;
+if (st.empty == before) return true;
+}
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  PART 6 — DFS SOLVER (find one solution)
+// ════════════════════════════════════════════════════════════════════
+
+bool solve(State& st) {
+if (!prop(st)) return false;
+if (!st.empty) return true;
+
+```
+// MRV: find cell with fewest candidates
+int bi_r = -1, bi_c = -1, mc = 17, bc = 0;
+for (int r = 0; r < N; r++) {
+    for (uint16_t fr = st.rows[r]; fr; fr &= fr-1) {
+        int c   = ctz(fr);
+        int cands = st.cv(r, c);
+        if (!cands) return false;
+        int cnt = popcnt(cands);
+        if (cnt < mc) { mc = cnt; bi_r = r; bi_c = c; bc = cands; }
+    }
+}
+if (bi_r < 0) return true;
+
+State sv = st;
+for (int tmp = bc; tmp;) {
+    int bit = tmp & (-tmp); tmp &= tmp-1;
+    st = sv;
+    st.place(bi_r, bi_c, ctz(bit)+1);
+    if (solve(st)) return true;
+}
+st = sv;
+return false;
+```
+
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  PART 7 — DFS COUNTER (count ALL solutions)
+//
+//  Uses __uint128_t to avoid overflow (can count up to ~3.4 × 10^38
+//  before overflowing — sufficient for S_fixed of 16x16 which is
+//  estimated around 10^99 … but realistically we’ll hit the limit
+//  long before finishing. Use –limit for partial counts.)
+//
+//  Progress is printed every 10M solutions found.
+// ════════════════════════════════════════════════════════════════════
+
+static __uint128_t g_count   = 0;
+static __uint128_t g_limit   = 0;   // 0 = no limit
+static bool        g_limited = false;
+static bool        g_stopped = false;
+static long long   g_nodes   = 0;
+
+void count_dfs(State st) {
+if (g_stopped) return;
+if (!prop(st)) return;
+if (!st.empty) {
+g_count++;
+g_nodes++;
+if (g_limited && g_count >= g_limit) { g_stopped = true; return; }
+if ((g_count & 0xFFFFFFULL) == 0) {
+// Print progress every ~16M solutions
+std::cout << “  … solutions so far: “;
+// Print __uint128_t manually
+__uint128_t tmp = g_count;
+char buf[50]; int len = 0;
+if (!tmp) buf[len++] = ‘0’;
+while (tmp) { buf[len++] = ‘0’ + (int)(tmp % 10); tmp /= 10; }
+for (int i = len-1; i >= 0; i–) std::cout << buf[i];
+std::cout << “\n”;
+std::cout.flush();
+}
+return;
+}
+
+```
+// MRV
+int bi_r = -1, bi_c = -1, mc = 17, bc = 0;
+for (int r = 0; r < N; r++) {
+    for (uint16_t fr = st.rows[r]; fr; fr &= fr-1) {
+        int c     = ctz(fr);
+        int cands = st.cv(r, c);
+        if (!cands) return;
+        int cnt = popcnt(cands);
+        if (cnt < mc) { mc = cnt; bi_r = r; bi_c = c; bc = cands; }
+    }
+}
+if (bi_r < 0) { g_count++; return; }
+
+g_nodes++;
+State sv = st;
+for (int tmp = bc; tmp; tmp &= tmp-1) {
+    int bit = tmp & (-tmp);
+    st = sv;
+    st.place(bi_r, bi_c, ctz(bit)+1);
+    count_dfs(st);
+    if (g_stopped) return;
+}
+```
+
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  PART 8 — I/O UTILITIES
+// ════════════════════════════════════════════════════════════════════
+
+// Print __uint128_t
+void print_u128(__uint128_t x) {
+if (!x) { std::cout << “0”; return; }
+char buf[50]; int len = 0;
+while (x) { buf[len++] = ‘0’ + (int)(x % 10); x /= 10; }
+for (int i = len-1; i >= 0; i–) std::cout << buf[i];
+}
+
+std::string extract_puzzle16(const std::string& raw) {
+std::string p;
+for (char c : raw) {
+if ((c >= ‘0’ && c <= ‘9’) || c == ‘.’ ||
+(c >= ‘A’ && c <= ‘G’) || (c >= ‘a’ && c <= ‘g’))
+p += c;
+}
+return ((int)p.size() >= N2) ? p.substr(0, N2) : “”;
+}
+
+void print_grid16(const State& st, const std::string& orig) {
+std::cout << “\n  ┌────────────────┬────────────────┬────────────────┬────────────────┐\n”;
+for (int r = 0; r < N; r++) {
+if (r && r % NB == 0)
+std::cout << “  ├────────────────┼────────────────┼────────────────┼────────────────┤\n”;
+std::cout << “  │”;
+for (int c = 0; c < N; c++) {
+if (c && c % NB == 0) std::cout << “ │”;
+int v = st.board[r*N + c];
+bool given = false;
+if (!orig.empty() && r*N+c < (int)orig.size()) {
+char ch = orig[r*N+c];
+given = (ch >= ‘1’ && ch <= ‘9’) || (ch >= ‘A’ && ch <= ‘G’) || (ch >= ‘a’ && ch <= ‘g’);
+}
+char sym = (v == 0) ? ‘.’ : (v <= 9 ? ‘0’+v : ‘A’+(v-10));
+if      (v == 0) std::cout << “ .”;
+else if (given)  std::cout << “ \033[36m” << sym << “\033[0m”;
+else             std::cout << “ \033[32m” << sym << “\033[0m”;
+}
+std::cout << “ │\n”;
+}
+std::cout << “  └────────────────┴────────────────┴────────────────┴────────────────┘\n”;
+std::cout << “  \033[36m■\033[0m = given   \033[32m■\033[0m = solved\n\n”;
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  PART 9 — COUNTING MODE
+//
+//  Fixes the first 4x4 block to 1..16 (canonical form).
+//  Then counts all valid completions = S_fixed.
+//
+//  N_total = 16! × S_fixed
+//  16! = 20 922 789 888 000
+// ════════════════════════════════════════════════════════════════════
+
+void count_mode(__uint128_t limit) {
+std::cout << “\n”;
+std::cout << “╔══════════════════════════════════════════════════════════╗\n”;
+std::cout << “║         Infandoku16 — Counting Mode                      ║\n”;
+std::cout << “║  Counting S_fixed (first block = 1..16 canonical form)   ║\n”;
+std::cout << “╚══════════════════════════════════════════════════════════╝\n\n”;
+
+```
+if (limit) {
+    std::cout << "  Limit set to: "; print_u128(limit); std::cout << " solutions\n";
+    g_limit   = limit;
+    g_limited = true;
+} else {
+    std::cout << "  No limit — WARNING: this may run for weeks/months.\n";
+    std::cout << "  Use --limit N to stop early.\n";
+}
+std::cout << "\n  Starting DFS with first block fixed to 1 2 3 4 / 5 6 7 8 / 9 A B C / D E F G ...\n\n";
+
+State st;
+// All cells empty
+memset(&st, 0, sizeof(st));
+for (int i = 0; i < N; i++)  st.rows[i] = st.cols[i] = FULL_CELL;
+for (int b = 0; b < NBLK; b++) st.blks[b] = FULL_CELL;
+st.empty = N2;
+
+// Fix first block
+if (!st.fix_first_block()) {
+    std::cout << "  ERROR: contradiction when fixing first block!\n";
+    return;
+}
+
+auto t0 = std::chrono::high_resolution_clock::now();
+g_count = 0; g_nodes = 0; g_stopped = false;
+
+count_dfs(st);
+
+double elapsed = std::chrono::duration<double>(
+    std::chrono::high_resolution_clock::now() - t0).count();
+
+std::cout << "\n══════════════════════════════════════════════════════════\n";
+std::cout << "  S_fixed (solutions with block 0 = 1..16) = ";
+print_u128(g_count); std::cout << "\n";
+std::cout << "  DFS nodes explored : " << g_nodes << "\n";
+std::cout << "  Time elapsed       : " << std::fixed << std::setprecision(2) << elapsed << " s\n\n";
+
+// Compute N_total = 16! × S_fixed
+__uint128_t fact16 = 1;
+for (int i = 1; i <= 16; i++) fact16 *= i;
+__uint128_t n_total = fact16 * g_count;
+
+std::cout << "  16! = "; print_u128(fact16); std::cout << "\n";
+std::cout << "  N_total = 16! × S_fixed = "; print_u128(n_total); std::cout << "\n";
+if (g_stopped)
+    std::cout << "\n  [STOPPED at limit — result is PARTIAL, not final]\n";
+std::cout << "══════════════════════════════════════════════════════════\n\n";
+```
+
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  PART 10 — INTERACTIVE SOLVER MODE
+// ════════════════════════════════════════════════════════════════════
+
+void interactive_mode() {
+std::cout << “\n”;
+std::cout << “╔══════════════════════════════════════════════════════════╗\n”;
+std::cout << “║           Infandoku16 — 16x16 Sudoku Solver              ║\n”;
+std::cout << “║         BitBoard + NS + HS + MRV-DFS                     ║\n”;
+std::cout << “║                 A. Infantine  (2026)                     ║\n”;
+std::cout << “╚══════════════════════════════════════════════════════════╝\n\n”;
+std::cout << “  Enter a 16x16 puzzle as 256 chars (0 or . = empty).\n”;
+std::cout << “  Values: 1..9 for 1-9, A..G for 10-16.\n”;
+std::cout << “  Type ‘quit’ to exit.\n\n”;
+
+```
+while (true) {
+    std::cout << "Puzzle16 > ";
+    std::string line;
+    if (!std::getline(std::cin, line)) break;
+    if (line == "quit" || line == "q") break;
+    if (line.empty()) continue;
+
+    std::string puz = extract_puzzle16(line);
+    if (puz.empty()) {
+        std::cout << "  \033[31mNeed 256 valid chars (0-9, A-G, or .).\033[0m\n\n";
+        continue;
+    }
+
+    State st; st.init(puz);
+    auto t0 = std::chrono::high_resolution_clock::now();
+    bool ok = solve(st);
+    double us = std::chrono::duration<double, std::micro>(
+        std::chrono::high_resolution_clock::now() - t0).count();
+
+    if (ok && st.valid()) {
+        print_grid16(st, puz);
+        std::cout << "  Valid : \033[32m✓ YES\033[0m\n";
+    } else {
+        std::cout << "  \033[31mNo solution found.\033[0m\n";
+    }
+    std::cout << "  Time  : " << std::fixed << std::setprecision(2) << us << " µs\n\n";
+}
+std::cout << "\nGoodbye.\n";
+```
+
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  PART 11 — MAIN
+// ════════════════════════════════════════════════════════════════════
+
+int main(int argc, char* argv[]) {
+T.build();
+
+```
+bool count_flag = false;
+__uint128_t limit = 0;
+
+for (int i = 1; i < argc; i++) {
+    std::string arg(argv[i]);
+    if (arg == "--count") {
+        count_flag = true;
+    } else if (arg == "--limit" && i+1 < argc) {
+        // Parse limit as uint64 (sufficient for testing)
+        limit = (__uint128_t)std::stoull(argv[++i]);
+    }
+}
+
+if (count_flag) {
+    count_mode(limit);
+} else if (!isatty(fileno(stdin))) {
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::string puz = extract_puzzle16(line);
+        if (puz.empty()) continue;
+        State st; st.init(puz);
+        bool ok = solve(st);
+        if (ok && st.valid()) {
+            for (int i = 0; i < N2; i++) {
+                int v = st.board[i];
+                std::cout << (char)(v <= 9 ? '0'+v : 'A'+(v-10));
+            }
+            std::cout << "\n";
+        } else {
+            std::cout << "NO_SOLUTION\n";
+        }
+    }
+} else {
+    interactive_mode();
+}
+
+return 0;
+```
+
+}
